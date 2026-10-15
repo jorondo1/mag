@@ -9,6 +9,28 @@ could not verify from the code alone: check them before relying on them.
 
 ---
 
+## Why we are doing this
+
+The main motivation is **file count, not speed**. `QUAST_BINS` runs `metaquast.py` once per bin,
+and each run writes a whole directory of reports, plots and logs (`QUAST/<bin>/...`) both in
+`work/` and in the published results. On datasets with thousands of bins this can exhaust
+the **inode quota** of an HPC filesystem, even when disk space is fine. `statswrapper.sh` writes
+**one small table per group of bins**. Runtime (#789) is a secondary benefit.
+
+Consequence for planning: the benefit only arrives when `QUAST_BINS` stops running (PR 2).
+PR 1 alone (statswrapper added next to QUAST) does **not** reduce the file count. Prepare PR 1
+and PR 2 together, and ask the maintainer whether they can be merged as one breaking change
+(open question 1).
+
+To put a number on it for the issue (run these yourself on a finished mag run):
+```bash
+find results/GenomeBinning/QC -type f | wc -l        # published QUAST files (adjust path to your outdir)
+find work -type f | wc -l                             # inodes used in work/ (whole run, not only QUAST)
+find results/GenomeBinning/QC/QUAST -type f | wc -l   # 🔎 check where QUAST_BINS publishes in your results
+```
+
+---
+
 ## 0. Ground rules
 
 | Rule | Source |
@@ -125,6 +147,31 @@ Write down answers to these (they decide the design):
 
 Paste the results into the issue (section 4); this is exactly the evidence a reviewer wants.
 
+### 3.4 Results so far (2026-10-15, BBMap 40.04, run on 3 gzipped SPAdes-COMEBin bins, ~1.9 Mbp each)
+
+Command that worked: `statswrapper.sh *.fa.gz format=3 > stats.tsv`.
+(An earlier attempt failed with `Unknown parameter *.fa` only because no plain `.fa` files
+existed, so bash passed the literal `*.fa`. Only use globs that match something.)
+
+| Question | Answer |
+| --- | --- |
+| 1. Header once or per file? | **Once**, then one row per file |
+| 2. File-name column | Last column, **`filename`**, an **absolute path including `.gz`** (BBMap resolves relative names) |
+| 3. Columns | `n_scaffolds n_contigs scaf_bp contig_bp gap_pct scaf_N50 scaf_L50 ctg_N50 ctg_L50 scaf_N90 scaf_L90 ctg_N90 ctg_L90 scaf_max ctg_max scaf_n_gt50K scaf_pct_gt50K gc_avg gc_std filename` |
+| 4. Gzip input | **Works** |
+| 5. Runtime vs QUAST | **Not measured yet** |
+| 6. Memory | Default `-Xmx200m` was enough for ~2 Mbp bins; 🔎 not tested on large/eukaryotic bins |
+
+Design consequences:
+- **Reduce `filename` to a basename and strip `.gz`** (in the module or in `combine_tables.py`),
+  or the exact bin-name check in `combine_tables.py` will fail.
+- **BBMap's N50/L50 naming is the reverse of QUAST's.** In the first row `scaf_N50 = 42` and
+  `scaf_L50 = 11064`: 42 is the *number* of scaffolds and 11064 the *length in bp*. QUAST's
+  "N50" is a length. Document this in `docs/output.md`, or rename the columns in the module.
+- `gc_avg` is a **fraction** (0.285), QUAST's `GC (%)` is a percentage.
+- No gene/rRNA, misassembly or per-100-kbp N columns (`gap_pct` is the nearest to the latter).
+  🔎 Compare against the `*_quast` header of a real `bin_summary.tsv` to list gained/lost columns.
+
 ---
 
 ## 4. Step 2: open the issue (before any code)
@@ -218,12 +265,14 @@ Estimated about 15-25 files, mostly snapshots.
 ### 6.2 Things that will bite you
 
 - **Bin name matching.** `combine_tables.py` errors if bin names differ (see `:241-244`).
-  statswrapper's file-name column may include `.gz` or a path. Normalise it like the QUAST code does.
+  statswrapper's `filename` column is an **absolute path ending in `.gz`** (section 3.4):
+  take the basename and strip `.gz` before merging.
+- **N50/L50 meaning is swapped** compared with QUAST (section 3.4): document it.
 - **`skip_*` interactions.** The `if` at `workflows/mag.nf:628` decides when `BIN_SUMMARY` runs,
   and `utils_nfcore_mag_pipeline/main.nf` (~419) contains an error check that includes `skip_quast`.
   Decide how the new toggle should interact; do not silently change existing behaviour.
 - **Dereplicated vs. all bins.** QUAST currently runs on `ch_input_for_postbinning`. Keep the same input.
-- **Gzip:** see section 3.3 question 4.
+- **Gzip:** statswrapper reads `.gz` directly (section 3.4), so no decompression step is needed.
 
 ### 6.3 How you test it
 
@@ -296,7 +345,11 @@ If the module (PR 0) takes longer than planned, **cut PR 1's polish, not its tes
 ## 9. Open questions (for the remote maintainer)
 
 1. **Staged or direct?** Add statswrapper next to QUAST first (PR 1, additive), then remove
-   `QUAST_BINS` in a later breaking release (PR 2)? Default assumed: staged.
+   `QUAST_BINS` in a later breaking release (PR 2)? Default assumed: staged, but note the
+   inode problem (see "Why we are doing this") is only solved by PR 2, so ask whether both can
+   target the next breaking release together, or whether PR 1 should at least let users
+   switch off bin-level QUAST without losing assembly-level QUAST (today `--skip_quast`
+   switches off both).
 2. **Assembly-level `QUAST`** (`modules/local/quast_run`): replace too (statswrapper works on
    assemblies as well, but loses misassembly-style metrics only QUAST gives, though with
    `--max-ref-number 0` these are limited anyway) or keep it?
@@ -342,4 +395,6 @@ If the module (PR 0) takes longer than planned, **cut PR 1's polish, not its tes
 | 2026-10-15 | Bakta, if done, is an optional alternative with Prokka as default | user |
 | 2026-10-15 | binette skipped for now | user |
 | 2026-10-15 | Assistant does not run commands unless asked | user |
+| 2026-10-15 | Main motivation is the inode/file-count burden of QUAST (not runtime) | user |
+| 2026-10-15 | statswrapper tested locally (BBMap 40.04): reads `.gz`, one header, `filename` is an absolute path; N50/L50 swapped vs QUAST | user's run |
 | 2026-10-15 | Staged approach (additive PR 1, breaking PR 2) and local-module-first are **assumed defaults**, pending maintainer answers | assistant |
